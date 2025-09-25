@@ -1,0 +1,14 @@
+# Virtual environments
+.venv/
+.venv_pdf/
+
+# Compiled bytecode
+__pycache__/
+*.py[cod]
+
+# Generated data outputs
+reddit_data/
+
+# Local artifacts
+.DS_Store
+lab5-f25-ocr.txt
