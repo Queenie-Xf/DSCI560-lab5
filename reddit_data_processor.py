@@ -506,11 +506,11 @@ class RedditDataProcessor:
             for method in sorting_methods:
                 try:
                     if method == 'hot':
-                        posts = subreddit.hot(limit=min(limit, 1000))
+                        posts = subreddit.hot(limit=min(limit, 5000))
                     elif method == 'top':
-                        posts = subreddit.top(limit=min(limit, 1000), time_filter='week')
+                        posts = subreddit.top(limit=min(limit, 5000), time_filter='week')
                     elif method == 'new':
-                        posts = subreddit.new(limit=min(limit, 1000))
+                        posts = subreddit.new(limit=min(limit, 5000))
                     break
                 except Exception as sort_error:
                     logging.warning(f"Failed to fetch {method} posts: {sort_error}")
@@ -857,7 +857,7 @@ Clustering:
         # Fetch data based on request size
         start_time = time.time()
         
-        if num_posts > 1000:
+        if num_posts > 5000:
             posts_data = self.fetch_large_dataset(subreddit_name, num_posts, batch_timeout=180)
         else:
             posts_data = self.fetch_posts_batch(subreddit_name, num_posts, timeout=180)
