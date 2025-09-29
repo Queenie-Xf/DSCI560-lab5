@@ -25,13 +25,13 @@ def process_iphone_data():
     # Settings for iPhone data processing
     config = {
         'subreddit': 'iphone',
-        'num_posts': 500,
+        'num_posts': 5000,
         'data_dir': 'reddit_data',
         'save_format': 'all'  # Save in all formats
     }
     
     print("=" * 60)
-    print("🍎 IPHONE REDDIT DATA PROCESSING")
+    print("IPHONE REDDIT DATA PROCESSING")
     print("=" * 60)
     print(f"Subreddit: r/{config['subreddit']}")
     print(f"Target posts: {config['num_posts']}")
@@ -57,31 +57,35 @@ def process_iphone_data():
         
         if result:
             print("\n" + "=" * 60)
-            print("✅ PROCESSING COMPLETED SUCCESSFULLY!")
+            print("[SUCCESS] PROCESSING COMPLETED SUCCESSFULLY!")
             print("=" * 60)
             print(f"Session ID: {result['session_id']}")
             print(f"Posts processed: {len(result['data'])}")
             print(f"Processing time: {result['processing_time']:.1f} seconds")
             print(f"Average time per post: {result['processing_time']/len(result['data']):.2f} seconds")
-            
-            print(f"\n📁 Files created:")
+
+            print(f"\nFiles created:")
             for format_type, filepath in result['files'].items():
                 file_size = os.path.getsize(filepath) / 1024  # Size in KB
                 print(f"  {format_type.upper():12}: {filepath} ({file_size:.1f} KB)")
 
-            print(f"  DATABASE   : {result['database_path']}")
+            # Handle both SQLite (database_path) and MySQL (database) formats
+            if 'database_path' in result:
+                print(f"  DATABASE   : {result['database_path']}")
+            elif 'database' in result:
+                print(f"  DATABASE   : MySQL ({result['database']})")
 
-            print(f"\n📊 Data ready for:")
+            print(f"\nData ready for:")
             print("  • Clustering algorithms (embeddings folder)")
             print("  • Automation scripts (processed folder)")
             print("  • Manual analysis (JSON files)")
-            
+
             # Show some quick stats
             posts_data = result['data']
             avg_score = sum(post['features']['score'] for post in posts_data) / len(posts_data)
             posts_with_images = sum(1 for post in posts_data if post['features']['has_image'])
-            
-            print(f"\n📈 Quick Stats:")
+
+            print(f"\nQuick Stats:")
             print(f"  • Average post score: {avg_score:.1f}")
             print(f"  • Posts with images: {posts_with_images} ({posts_with_images/len(posts_data)*100:.1f}%)")
             if result.get('embedding_feature_names'):
@@ -98,22 +102,22 @@ def process_iphone_data():
 
             return result
         else:
-            print("❌ Processing failed - check logs for details")
+            print("[FAILED] Processing failed - check logs for details")
             return None
-            
+
     except Exception as e:
-        print(f"❌ Error during processing: {e}")
+        print(f"[ERROR] Error during processing: {e}")
         return None
 
 def main():
     """Main function - just run the iPhone processing"""
     result = process_iphone_data()
-    
+
     if result:
-        print(f"\n🎉 All done! Check the 'reddit_data' folder for your processed iPhone data.")
+        print(f"\nAll done! Check the 'reddit_data' folder for your processed iPhone data.")
         print(f"Next step: Use the clustering-ready data in 'reddit_data/embeddings/' folder")
     else:
-        print(f"\n💥 Something went wrong. Check the error messages above.")
+        print(f"\n[ERROR] Something went wrong. Check the error messages above.")
 
 if __name__ == "__main__":
     main()

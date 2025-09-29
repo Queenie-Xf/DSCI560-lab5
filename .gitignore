@@ -8,7 +8,17 @@ __pycache__/
 
 # Generated data outputs
 reddit_data/
+test_data/
+
+# Log files
+*.log
+current_impl_test.log
+ravi_impl_test.log
 
 # Local artifacts
 .DS_Store
 lab5-f25-ocr.txt
+
+# Visualization outputs (keep directory, ignore contents)
+visualizations/*.png
+visualizations/*.txt

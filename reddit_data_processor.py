@@ -18,7 +18,7 @@ import pickle
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
-import sqlite3
+from database_connection import SQLiteConnection
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 from gensim.models.doc2vec import Doc2Vec, TaggedDocument
@@ -51,10 +51,8 @@ class RedditDataProcessor:
                          self.embeddings_dir, self.metadata_dir]:
             directory.mkdir(exist_ok=True)
 
-        # Initialize lightweight relational storage (SQLite) for processed posts
-        self.db_path = self.data_dir / "reddit_posts.db"
-        self.db_conn = sqlite3.connect(self.db_path)
-        self.db_conn.execute("PRAGMA foreign_keys = ON;")
+        # Initialize MySQL database connection for processed posts
+        self.db_conn = SQLiteConnection()
         self._initialize_database()
 
         # Initialize data tracking
@@ -62,12 +60,80 @@ class RedditDataProcessor:
         logging.info(f"Data processing session started: {self.session_id}")
         logging.info(f"Data storage initialized at: {self.data_dir}")
 
+    def load_existing_posts_from_database(self):
+        """Load all existing posts from database with their embeddings"""
+        try:
+            results = self.db_conn.execute_query("""
+                SELECT id, title, content, cleaned_content, embedding, keywords, topics,
+                       subreddit, features, created_datetime
+                FROM posts
+                WHERE embedding IS NOT NULL
+            """, fetch='all')
+
+            posts = []
+            for row in results:
+                post_id, title, content, cleaned_content, embedding_json, keywords_json, topics_json, \
+                subreddit, features_json, created_datetime = row
+
+                # Parse JSON fields
+                try:
+                    embedding = json.loads(embedding_json) if embedding_json else None
+                    keywords = json.loads(keywords_json) if keywords_json else []
+                    topics = json.loads(topics_json) if topics_json else []
+                    features = json.loads(features_json) if features_json else {}
+                except:
+                    embedding = None
+                    keywords = []
+                    topics = []
+                    features = {}
+
+                if embedding:  # Only include posts with embeddings
+                    posts.append({
+                        'id': post_id,
+                        'title': title or '',
+                        'content': content or '',
+                        'cleaned_content': cleaned_content or '',
+                        'embedding': embedding,
+                        'keywords': keywords,
+                        'topics': topics,
+                        'subreddit': subreddit,
+                        'features': features  # Use features as-is, already has score, num_comments, etc.
+                    })
+
+            logging.info(f"Loaded {len(posts)} existing posts from database")
+            return posts
+        except Exception as e:
+            logging.error(f"Error loading posts from database: {e}")
+            return []
+
+    def delete_all_cluster_assignments(self):
+        """Delete all cluster assignments to prepare for reclustering"""
+        try:
+            self.db_conn.execute_query("DELETE FROM clusters", fetch=None)
+            logging.info("Deleted all existing cluster assignments")
+        except Exception as e:
+            logging.error(f"Error deleting cluster assignments: {e}")
+
+    def merge_posts(self, existing_posts, new_posts):
+        """Merge new posts with existing, avoiding duplicates"""
+        existing_ids = {post['id'] for post in existing_posts}
+        merged = list(existing_posts)  # Start with all existing
+
+        new_count = 0
+        for post in new_posts:
+            if post['id'] not in existing_ids:
+                merged.append(post)
+                new_count += 1
+
+        logging.info(f"Merged posts: {len(existing_posts)} existing + {new_count} new = {len(merged)} total")
+        return merged
+
     def close(self):
         """Release database resources when finished."""
         try:
             if hasattr(self, 'db_conn') and self.db_conn:
                 self.db_conn.close()
-        except sqlite3.Error as db_error:
+        except Exception as db_error:
             logging.warning(f"Error closing database connection: {db_error}")
 
     def __del__(self):
@@ -163,9 +229,8 @@ class RedditDataProcessor:
             FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE
         );
         """
-        with self.db_conn:
-            self.db_conn.execute(create_posts_sql)
-            self.db_conn.execute(create_clusters_sql)
+        self.db_conn.execute_query(create_posts_sql)
+        self.db_conn.execute_query(create_clusters_sql)
     
     def extract_image_text(self, url):
         """Extract text from images using OCR with error handling"""
@@ -202,60 +267,59 @@ class RedditDataProcessor:
         return ""
 
     def save_posts_to_database(self, posts_data):
-        """Persist processed posts into the SQLite database."""
+        """Persist processed posts into the MySQL database."""
         if not posts_data:
             logging.warning("No posts available for database persistence")
             return 0
 
         rows_inserted = 0
-        with self.db_conn:
-            for post in posts_data:
-                try:
-                    self.db_conn.execute(
-                        """
-                        INSERT OR REPLACE INTO posts (
-                            id,
-                            session_id,
-                            subreddit,
-                            title,
-                            content,
-                            cleaned_content,
-                            image_text,
-                            keywords,
-                            topics,
-                            extracted_urls,
-                            extracted_mentions,
-                            extracted_hashtags,
-                            features,
-                            embedding,
-                            created_datetime,
-                            processed_timestamp
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            post.get('id'),
-                            post.get('session_id'),
-                            post.get('subreddit'),
-                            post.get('title'),
-                            post.get('content'),
-                            post.get('cleaned_content'),
-                            post.get('image_text'),
-                            json.dumps(post.get('keywords', []), ensure_ascii=False),
-                            json.dumps(post.get('topics', []), ensure_ascii=False),
-                            json.dumps(post.get('extracted_urls', []), ensure_ascii=False),
-                            json.dumps(post.get('extracted_mentions', []), ensure_ascii=False),
-                            json.dumps(post.get('extracted_hashtags', []), ensure_ascii=False),
-                            json.dumps(post.get('features', {}), ensure_ascii=False),
-                            json.dumps(post.get('embedding'), ensure_ascii=False) if post.get('embedding') is not None else None,
-                            post.get('created_datetime'),
-                            post.get('processed_timestamp')
-                        )
+        for post in posts_data:
+            try:
+                self.db_conn.execute_query(
+                    """
+                    INSERT OR REPLACE INTO posts (
+                        id,
+                        session_id,
+                        subreddit,
+                        title,
+                        content,
+                        cleaned_content,
+                        image_text,
+                        keywords,
+                        topics,
+                        extracted_urls,
+                        extracted_mentions,
+                        extracted_hashtags,
+                        features,
+                        embedding,
+                        created_datetime,
+                        processed_timestamp
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        post.get('id'),
+                        post.get('session_id'),
+                        post.get('subreddit'),
+                        post.get('title'),
+                        post.get('content'),
+                        post.get('cleaned_content'),
+                        post.get('image_text'),
+                        json.dumps(post.get('keywords', []), ensure_ascii=False),
+                        json.dumps(post.get('topics', []), ensure_ascii=False),
+                        json.dumps(post.get('extracted_urls', []), ensure_ascii=False),
+                        json.dumps(post.get('extracted_mentions', []), ensure_ascii=False),
+                        json.dumps(post.get('extracted_hashtags', []), ensure_ascii=False),
+                        json.dumps(post.get('features', {}), ensure_ascii=False),
+                        json.dumps(post.get('embedding'), ensure_ascii=False) if post.get('embedding') is not None else None,
+                        post.get('created_datetime'),
+                        post.get('processed_timestamp')
                     )
-                    rows_inserted += 1
-                except sqlite3.Error as db_error:
-                    logging.error(f"Failed to persist post {post.get('id')}: {db_error}")
+                )
+                rows_inserted += 1
+            except Exception as db_error:
+                logging.error(f"Failed to persist post {post.get('id')}: {db_error}")
 
-        logging.info(f"Persisted {rows_inserted} posts to database at {self.db_path}")
+        logging.info(f"Persisted {rows_inserted} posts to SQLite database")
         return rows_inserted
 
     def save_clusters_to_database(self, cluster_assignments, session_id):
@@ -263,23 +327,22 @@ class RedditDataProcessor:
         if not cluster_assignments:
             return 0
 
-        with self.db_conn:
-            for entry in cluster_assignments:
-                try:
-                    self.db_conn.execute(
-                        """
-                        INSERT OR REPLACE INTO clusters (post_id, session_id, cluster_id, distance)
-                        VALUES (?, ?, ?, ?)
-                        """,
-                        (
-                            entry['post_id'],
-                            session_id,
-                            entry['cluster_id'],
-                            entry['distance']
-                        )
+        for entry in cluster_assignments:
+            try:
+                self.db_conn.execute_query(
+                    """
+                    INSERT OR REPLACE INTO clusters (post_id, session_id, cluster_id, distance)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        entry['post_id'],
+                        session_id,
+                        entry['cluster_id'],
+                        entry['distance']
                     )
-                except sqlite3.Error as db_error:
-                    logging.error(f"Failed to persist cluster info for {entry['post_id']}: {db_error}")
+                )
+            except Exception as db_error:
+                logging.error(f"Failed to persist cluster info for {entry['post_id']}: {db_error}")
 
         logging.info(f"Persisted {len(cluster_assignments)} cluster assignments")
         return len(cluster_assignments)
@@ -353,10 +416,11 @@ class RedditDataProcessor:
             # Extract image text if available
             image_text = ""
             image_urls = []
-            if hasattr(post, 'url') and post.url:
-                image_text = self.extract_image_text(post.url)
-                if image_text:
-                    image_urls.append(post.url)
+            # Disable slow image processing for performance
+            # if hasattr(post, 'url') and post.url:
+            #     image_text = self.extract_image_text(post.url)
+            #     if image_text:
+            #         image_urls.append(post.url)
             
             # Combine all textual content
             title_text = post.title or ""
@@ -506,11 +570,11 @@ class RedditDataProcessor:
             for method in sorting_methods:
                 try:
                     if method == 'hot':
-                        posts = subreddit.hot(limit=min(limit, 5000))
+                        posts = subreddit.hot(limit=min(limit, 1000))
                     elif method == 'top':
-                        posts = subreddit.top(limit=min(limit, 5000), time_filter='week')
+                        posts = subreddit.top(limit=min(limit, 1000), time_filter='all')
                     elif method == 'new':
-                        posts = subreddit.new(limit=min(limit, 5000))
+                        posts = subreddit.new(limit=min(limit, 1000))
                     break
                 except Exception as sort_error:
                     logging.warning(f"Failed to fetch {method} posts: {sort_error}")
@@ -582,11 +646,9 @@ class RedditDataProcessor:
             retry_count = 0
             all_posts.extend(batch_posts)
             
-            # Wait between batches for large requests
+            # No wait between batches - optimized for speed
             if len(all_posts) < total_posts:
-                wait_time = 45 if total_posts > 2000 else 30
-                logging.info(f"Waiting {wait_time} seconds before next batch...")
-                time.sleep(wait_time)
+                logging.info(f"Processing next batch... ({len(all_posts)}/{total_posts} posts collected)")
         
         return all_posts[:total_posts]
     
@@ -705,6 +767,159 @@ class RedditDataProcessor:
 
         return clustering_ready
 
+    def _find_optimal_clusters(self, embeddings, min_k=3, max_k=10):
+        """
+        Use Elbow Method to find optimal number of clusters.
+        Calculates WCSS (Within-Cluster Sum of Squares) for different k values
+        and finds the elbow point using the rate of decrease.
+        """
+        n_samples = len(embeddings)
+
+        # Adjust max_k based on dataset size
+        # Rule of thumb: max clusters = sqrt(n/2)
+        suggested_max = int(np.sqrt(n_samples / 2))
+        max_k = min(max_k, max(min_k + 1, suggested_max))
+
+        # Ensure we have enough samples
+        max_k = min(max_k, n_samples - 1)
+
+        if max_k < min_k:
+            logging.warning(f"Not enough samples for clustering. Using {min_k} clusters.")
+            return min_k
+
+        wcss = []
+        k_range = range(min_k, max_k + 1)
+
+        logging.info(f"Finding optimal clusters using Elbow Method (testing k={min_k} to {max_k})...")
+
+        for k in k_range:
+            try:
+                kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+                kmeans.fit(embeddings)
+                wcss.append(kmeans.inertia_)
+            except Exception as e:
+                logging.warning(f"Failed to compute k={k}: {e}")
+                continue
+
+        if len(wcss) < 2:
+            logging.warning("Could not compute WCSS. Using default cluster count.")
+            return min_k
+
+        # Find elbow using rate of change (second derivative)
+        # The elbow is where the rate of decrease slows down significantly
+        deltas = np.diff(wcss)
+        second_deltas = np.diff(deltas)
+
+        if len(second_deltas) > 0:
+            # Find the point with maximum second derivative (biggest change in slope)
+            elbow_idx = np.argmax(second_deltas) + min_k
+        else:
+            # Fallback: use midpoint
+            elbow_idx = min_k + len(wcss) // 2
+
+        # Ensure we stay within valid range
+        optimal_k = max(min_k, min(elbow_idx, max_k))
+
+        logging.info(f"Optimal number of clusters determined: {optimal_k} (WCSS: {wcss})")
+
+        return optimal_k
+
+    def _merge_small_clusters(self, clustering_result, embeddings, index_map, posts_data, min_cluster_size=3):
+        """
+        Merge clusters with fewer than min_cluster_size posts into their nearest neighbor cluster.
+        This handles outliers that form their own tiny clusters.
+        """
+        assignments = clustering_result['assignments']
+        centroids = clustering_result['centroids']
+
+        # Count posts per cluster
+        cluster_counts = {}
+        for assignment in assignments:
+            cid = assignment['cluster_id']
+            cluster_counts[cid] = cluster_counts.get(cid, 0) + 1
+
+        # Find small clusters that need merging
+        small_clusters = [cid for cid, count in cluster_counts.items() if count < min_cluster_size]
+
+        if not small_clusters:
+            logging.info("No small clusters to merge")
+            return clustering_result
+
+        logging.info(f"Found {len(small_clusters)} small clusters (< {min_cluster_size} posts): {small_clusters}")
+
+        # For each small cluster, find nearest large cluster
+        merge_map = {}  # small_cluster_id -> target_cluster_id
+        large_clusters = [cid for cid, count in cluster_counts.items() if count >= min_cluster_size]
+
+        if not large_clusters:
+            # If all clusters are small, keep the original clustering
+            logging.warning("All clusters are small. Keeping original clustering.")
+            return clustering_result
+
+        for small_cid in small_clusters:
+            small_centroid = centroids[small_cid]
+
+            # Find nearest large cluster by centroid distance
+            min_distance = float('inf')
+            nearest_cid = large_clusters[0]
+
+            for large_cid in large_clusters:
+                large_centroid = centroids[large_cid]
+                distance = np.linalg.norm(small_centroid - large_centroid)
+
+                if distance < min_distance:
+                    min_distance = distance
+                    nearest_cid = large_cid
+
+            merge_map[small_cid] = nearest_cid
+            logging.info(f"Merging cluster {small_cid} ({cluster_counts[small_cid]} posts) into cluster {nearest_cid} (distance: {min_distance:.3f})")
+
+        # Reassign posts from small clusters
+        new_assignments = []
+        for assignment in assignments:
+            old_cid = assignment['cluster_id']
+            new_cid = merge_map.get(old_cid, old_cid)  # Use merge target if exists, otherwise keep original
+
+            # Recalculate distance to new centroid if cluster changed
+            if new_cid != old_cid:
+                # Find post embedding
+                post_id = assignment['post_id']
+                post_idx = next((i for i, p in enumerate(posts_data) if p['id'] == post_id), None)
+                if post_idx is not None and post_idx in index_map:
+                    embedding_idx = index_map.index(post_idx)
+                    post_embedding = embeddings[embedding_idx]
+                    new_centroid = centroids[new_cid]
+                    new_distance = np.linalg.norm(post_embedding - new_centroid)
+                else:
+                    new_distance = assignment['distance']  # Fallback
+            else:
+                new_distance = assignment['distance']
+
+            new_assignments.append({
+                'post_id': assignment['post_id'],
+                'cluster_id': new_cid,
+                'distance': float(new_distance)
+            })
+
+        # Update centroid examples - remove small clusters and keep large ones
+        new_centroid_examples = [
+            ex for ex in clustering_result['centroid_examples']
+            if ex['cluster_id'] not in small_clusters
+        ]
+
+        # Update cluster count
+        new_n_clusters = len(large_clusters)
+
+        logging.info(f"Merged {len(small_clusters)} small clusters. Final cluster count: {new_n_clusters}")
+
+        return {
+            'assignments': new_assignments,
+            'centroid_examples': new_centroid_examples,
+            'n_clusters': new_n_clusters,
+            'centroids': centroids,
+            'merged_clusters': merge_map  # Record what was merged
+        }
+
     def cluster_posts(self, posts_data, num_clusters=None):
         """Run KMeans clustering on Doc2Vec embeddings and surface centroid exemplars."""
         embeddings = []
@@ -721,7 +936,8 @@ class RedditDataProcessor:
             return None
 
         if num_clusters is None:
-            num_clusters = max(2, min(10, len(embeddings) // 50 or 2))
+            # Use Elbow Method to find optimal number of clusters
+            num_clusters = self._find_optimal_clusters(embeddings)
 
         try:
             kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
@@ -764,11 +980,17 @@ class RedditDataProcessor:
                         'distance': float(distance)
                     })
 
-            return {
+            # Post-process: merge small outlier clusters
+            result = {
                 'assignments': cluster_assignments,
                 'centroid_examples': centroid_examples,
-                'n_clusters': num_clusters
+                'n_clusters': num_clusters,
+                'centroids': centroids
             }
+
+            result = self._merge_small_clusters(result, embeddings, index_map, posts_data, min_cluster_size=3)
+
+            return result
         except Exception as cluster_error:
             logging.error(f"Clustering failed: {cluster_error}")
             return None
@@ -850,17 +1072,24 @@ Clustering:
 
         return summary
     
-    def process_data(self, subreddit_name, num_posts, save_format='all'):
-        """Main data processing pipeline"""
-        logging.info(f"Starting data processing: r/{subreddit_name}, {num_posts} posts")
-        
+    def process_data(self, subreddit_name, num_posts, save_format='all', recluster_all=True):
+        """Main data processing pipeline
+
+        Args:
+            subreddit_name: Name of subreddit to scrape
+            num_posts: Number of posts to fetch
+            save_format: Format to save data ('json', 'pickle', 'clustering', 'all')
+            recluster_all: If True, load existing posts and recluster everything together
+        """
+        logging.info(f"Starting data processing: r/{subreddit_name}, {num_posts} posts (recluster_all={recluster_all})")
+
         # Fetch data based on request size
         start_time = time.time()
-        
-        if num_posts > 5000:
-            posts_data = self.fetch_large_dataset(subreddit_name, num_posts, batch_timeout=180)
+
+        if num_posts > 1000:
+            posts_data = self.fetch_large_dataset(subreddit_name, num_posts, batch_timeout=60)
         else:
-            posts_data = self.fetch_posts_batch(subreddit_name, num_posts, timeout=180)
+            posts_data = self.fetch_posts_batch(subreddit_name, num_posts, timeout=60)
 
         processing_time = time.time() - start_time
 
@@ -896,14 +1125,35 @@ Clustering:
             for post in posts_data:
                 post['embedding'] = None
 
-        # Run clustering using Doc2Vec embeddings
-        clustering_result = self.cluster_posts(posts_data)
-        cluster_assignments = clustering_result['assignments'] if clustering_result else []
-
-        # Persist processed posts to database
+        # Persist processed posts to database FIRST (before clustering)
         self.save_posts_to_database(posts_data)
-        if cluster_assignments:
-            self.save_clusters_to_database(cluster_assignments, self.session_id)
+
+        # Run clustering using Doc2Vec embeddings
+        if recluster_all:
+            # Load existing posts and recluster everything together
+            logging.info("Loading existing posts for full reclustering...")
+            existing_posts = self.load_existing_posts_from_database()
+
+            # Merge with new posts
+            all_posts = self.merge_posts(existing_posts, posts_data)
+
+            # Recluster all posts
+            logging.info(f"Reclustering {len(all_posts)} total posts...")
+            clustering_result = self.cluster_posts(all_posts)
+            cluster_assignments = clustering_result['assignments'] if clustering_result else []
+
+            # Delete old cluster assignments and save new ones
+            if cluster_assignments:
+                logging.info("Deleting old cluster assignments...")
+                self.delete_all_cluster_assignments()
+                logging.info(f"Saving {len(cluster_assignments)} new cluster assignments...")
+                self.save_clusters_to_database(cluster_assignments, self.session_id)
+        else:
+            # Just cluster the new batch (old behavior, creates duplicates)
+            clustering_result = self.cluster_posts(posts_data)
+            cluster_assignments = clustering_result['assignments'] if clustering_result else []
+            if cluster_assignments:
+                self.save_clusters_to_database(cluster_assignments, self.session_id)
 
         logging.info(f"Data collection completed in {processing_time:.1f} seconds")
         logging.info(f"Successfully processed {len(posts_data)} posts")
@@ -954,7 +1204,7 @@ Clustering:
             'session_id': self.session_id,
             'processing_time': processing_time,
             'embedding_feature_names': embedding_feature_names,
-            'database_path': str(self.db_path),
+            'database': 'SQLite (reddit_data)',
             'clusters': clustering_result,
             'doc2vec_vector_size': doc2vec_vector_size
         }
@@ -968,7 +1218,7 @@ def main():
     # Command line arguments
     parser = argparse.ArgumentParser(description='Reddit Data Processing for Clustering & Automation')
     parser.add_argument('--subreddit', default='iphone', help='Subreddit to scrape')
-    parser.add_argument('--posts', type=int, default=500, help='Number of posts to fetch')
+    parser.add_argument('--posts', type=int, default=5000, help='Number of posts to fetch')
     parser.add_argument('--data-dir', default='reddit_data', help='Data storage directory')
     parser.add_argument('--format', choices=['json', 'pickle', 'clustering', 'all'], 
                        default='all', help='Output format')
